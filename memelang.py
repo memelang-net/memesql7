@@ -1,8 +1,10 @@
-# Memelang v7.09 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
+# Memelang v7.10 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
 # This script is optimized for teaching LLMs
 
-import random, re, json
+import random, re, json, copy
 from typing import List, Dict, Any
+
+Vector = Dict[int, Any]
 
 CMA, SPC, END, WILD, SIGIL_L2R = ',', ' ', ';', '*', '#'
 
@@ -25,14 +27,17 @@ TOKEN_KIND_PATTERNS = (
 
 MASTER_PATTERN = re.compile('|'.join(f'(?P<{kind}>{pat})' for kind, pat in TOKEN_KIND_PATTERNS))
 
-DAT_KINDS = {'VAR', 'WILD', 'IDENT', 'INT', 'FLOAT', 'QUOTE', 'SAME'}
+LIT_STR_KINDS = {'IDENT', 'QUOTE', 'STAR'}
+LIT_NUM_KINDS = {'INT', 'FLOAT'}
+VAR_KINDS = {'VAR', 'WILD', 'SAME'}
 
 
+# pre-orthotope
 class Token:
-	def __init__(self, beg: int, kind: str, lexeme: str):
-		self.beg: int = beg
+	def __init__(self, kind: str, lexeme: str, source_position: int = -1):
 		self.kind: str = kind
 		self.lexeme: str = lexeme
+		self.source_position: int = source_position
 		self.datum: Any
 
 		if kind == 'QUOTE':		self.datum = json.loads(lexeme)
@@ -40,100 +45,129 @@ class Token:
 		elif kind == 'INT':		self.datum = int(lexeme)
 		else:					self.datum = str(lexeme)
 
-	def __iter__(self): yield from (self.beg, self.kind, self.lexeme, self.datum)
+	def __iter__(self): yield from (self.kind, self.lexeme, self.source_position, self.datum)
 	def __str__(self)->str: return self.lexeme
 	__repr__ = __str__
 
-DEF_KEY_OPR = Token(-1, 'OPR', '') # INTENTIONALLY EMPTY
+KEY_EQUALS = Token('OPR', '') # INTENTIONALLY EMPTY
+VAL_EQUALS = Token('OPR', '=')
 
 
-# Ordinate ::= OPR_TOKEN DAT_TOKEN {, DAT_TOKEN}
-# 1-dimension
-class Ordinate:
-	def __init__(self, opr: Token, dat: List[Token], beg: int, end: int):
+class TokenStream:
+	def __init__(self, src: str):
+		self.tokens: List[Token] = []
+		self.length = 0
+		self.i = 0
+		for m in MASTER_PATTERN.finditer(src):
+			kind = m.lastgroup
+			text = m.group()
+			if kind == 'COMMENT': continue
+			if kind == 'MISMATCH': raise SyntaxError(f"Unexpected char {text!r} at {m.start()}")
+			self.append(Token(kind, text, m.start()))
+
+	def append(self, token: Token):
+		self.tokens.append(token)
+		self.length+=1
+
+	def peek(self) -> Token | None:
+		return self.tokens[self.i] if self.i < self.length else None
+
+	def peek_kind(self, kinds: str|set) -> bool:
+		token = self.peek()
+		if isinstance(kinds, str): kinds = {kinds}
+		return token and token.kind in kinds
+
+	def next(self) -> Token:
+		tok = self.peek()
+		if tok is None: raise SyntaxError("E_EOF")
+		self.i += 1
+		return tok
+
+	def continue_until(self, continue_until_kind:str) -> bool:
+		return self.i < self.length and self.tokens[self.i].kind != continue_until_kind
+
+
+# Unitope ::= OPR_TOKEN DAT_TOKEN {, DAT_TOKEN}
+# 1-orthotope
+class Unitope:
+	def __init__(self, opr: Token, dat: List[Token]):
 		self.opr = opr
 		self.dat = dat
-		self.beg = beg
-		self.end = end
-		self.certain = opr.lexeme in ('','=') and len(dat)==1 and dat[0].kind in ('INT','FLOAT','IDENT','QUOTE')
+		self.certain = opr.lexeme in ('','=') and len(dat)==1 and dat[0].kind in (LIT_STR_KINDS | LIT_NUM_KINDS)
 
 	@classmethod
-	def from_tokens(cls, tokens: List[Token], i: int, implicit_opr: bool = False) -> 'Ordinate':
+	def from_tokens(cls, tokens: TokenStream, implicit_opr: bool = False) -> 'Unitope':
 		# NEVER SPACES INSIDE
-		beg = i
-		n = len(tokens)
-		if i >= n: raise SyntaxError("E_EOF")
 		
 		# 1. OPR_TOKEN
 		# NEVER SPACES AROUND OPERATOR
-		if tokens[i].kind == 'OPR': opr = tokens[i]; i+=1
-		elif implicit_opr: opr = DEF_KEY_OPR
+		if tokens.peek_kind('OPR'): opr = tokens.next()
+		elif implicit_opr: opr = KEY_EQUALS
 		else: raise SyntaxError(f'E_OPR')
 
 		# 2. DAT_TOKEN {, DAT_TOKEN}
 		# NEVER WRAP LIST IN QUOTES
 		dat: List[Token] = []
-		while i < n:
+		while tokens.continue_until('STATE_SEP'):
 			# 2b. DAT_TOKEN
-			if i >= n or tokens[i].kind not in DAT_KINDS: raise SyntaxError(f'E_LIST')
-			dat.append(tokens[i])
-			i += 1
-
+			if tokens.peek_kind(LIT_STR_KINDS | LIT_NUM_KINDS | VAR_KINDS): dat.append(tokens.next())
+			else: raise SyntaxError(f'E_LIST')
+			
 			# 2c. COMMA BEFORE ANOTHER OPTIONAL TOKEN
-			if i < n and tokens[i].kind == 'DAT_SEP':
+			if tokens.peek_kind('DAT_SEP'):
 				# NEVER SPACES AROUND COMMAS
 				# NEVER WILDCARD IN LIST
 				if dat[-1].kind=='WILD': raise SyntaxError(f'E_WILD_LIST')
-				i += 1
+				tokens.next()
 			else: break
 
-		return cls(opr, dat, beg, i)
+		if not dat: raise SyntaxError(f'E_DAT')
 
-	# RETURN FIRST DATUM
-	def datum(self) -> Any: return self.dat[0].datum
+		# AWALYS GREATER/LESSER SINGLE DAT INT/FLOAT
+		if opr.lexeme in {'>','<','>=','<='}:
+			# NEVER GREATER/LESSER LIST
+			if len(dat)>1: raise SyntaxError(f'E_OPR_LIST')
+			# NEVER GREATER/LESSER STRNG
+			if dat.kind in LIT_STR_KINDS: raise SyntaxError(f'E_OPR_KIND')
 
-	# RETURN FIRST KIND
-	def kind(self) -> Any: return self.dat[0].kind
+		return cls(opr, dat)
+
+	def first_datum(self) -> Any: return self.dat[0].datum
+	def first_kind(self) -> Any: return self.dat[0].kind
 
 	# =DAT1,DAT2
 	def __str__(self) -> str: return str(self.opr) + CMA.join(map(str, self.dat))
 	__repr__ = __str__
 
-SAME_ORDINATE = Ordinate(Token(-1, 'OPR', '='), [Token(-1, 'SAME', '_')], -1, -1)
+SAME_ORDINATE = Unitope(VAL_EQUALS, [Token('SAME', '_')])
 
 
-# Coordinate ::= Ordinate Ordinate {SPC Ordinate Ordinate}
-# n-dimension
-class Coordinate:
+# Orthotope ::= Dimension Unitope {SPC Dimension Unitope}
+# n-group of unitopes or n-orthotope
+class Orthotope:
 	def __init__(self):
-		self.ordinates: Dict[int, Ordinate] = {}
-		self.beg = 0
-		self.end = 0
+		self.unitopes: Dict[int, Unitope] = {}
 		self.certain = None
 
 	@classmethod
-	def from_tokens(cls, tokens: List[Token], i: int, carry_forward_dimensions:List[int]|None = None, KEYMAP: Dict[str, int]|None = None) -> "Coordinate":
-		coordinate = cls()
-		coordinate.beg = i
-		coordinate.end = i
-		n = len(tokens)
-		if not KEYMAP: KEYMAP = {}
+	def from_tokens(cls, tokens: TokenStream, carry_forward_dimensions:List[int]|None = None, KEYMAP: Dict[str, int]|None = None) -> "Orthotope":
+		orthotope = cls()
+		if KEYMAP is None: KEYMAP = {}
 		prior_val_dimension = None
 		certain = True
 
-		while i < n and tokens[i].kind not in {'STATE_SEP'}:
+		while tokens.continue_until('STATE_SEP'):
+			token_i_reset = tokens.i
 			
 			# SKIP SEP BETWEEN PAIRS
-			if tokens[i].kind == 'PAIR_SEP':
-				i += 1
-				continue
+			while tokens.peek_kind('PAIR_SEP'): tokens.next()
 
 			# 1. KEY
 			# KEY OPERATOR IS: ALMOST ALWAYS '' (EMPTY), SOMETIMES '!' (NOT)
 			# NEVER SPACES INSIDE
-			key_ordinate = Ordinate.from_tokens(tokens, i, True)
+			key_ordinate = Unitope.from_tokens(tokens, True)
 			val_dimension = None
-			first_key = key_ordinate.datum()
+			first_key = key_ordinate.first_datum()
 
 			# 1a. TRY TO MAP first_key TO val_dimension
 			if key_ordinate.certain:
@@ -141,23 +175,23 @@ class Coordinate:
 				elif first_key in KEYMAP: val_dimension = KEYMAP[first_key]
 
 				# RESTART BEFORE HIGHER DIMENSION
-				if val_dimension is not None and prior_val_dimension is not None and val_dimension >= prior_val_dimension: break
+				if val_dimension is not None and prior_val_dimension is not None and val_dimension >= prior_val_dimension:
+					tokens.i=token_i_reset
+					break
 			else: certain = False
 			
 			# 1b. NO MAP, SPlIT KEYx=VALy into 1:KEYx, 0:VALy
 			if val_dimension is None:
-				coordinate.ordinates[1]=key_ordinate
+				orthotope.unitopes[1]=key_ordinate
 				val_dimension = 0
 
 			# 2. VAL
 			# VAL STRING OPERATOR IS: OFTEN '=', SOMETIMES '!='
 			# VAL NUMERIC OPERATORS ARE: '=', '!=', '>', '<', '>=', '<='
 			# NEVER SPACES INSIDE
-			coordinate.ordinates[val_dimension]=Ordinate.from_tokens(tokens, key_ordinate.end, False)
-			i = coordinate.ordinates[val_dimension].end
-			coordinate.end = i
+			orthotope.unitopes[val_dimension]=Unitope.from_tokens(tokens, False)
 
-			if not coordinate.ordinates[val_dimension].certain: certain = False
+			if not orthotope.unitopes[val_dimension].certain: certain = False
 
 			# RESTART AFTER ZERO DIMENSION
 			if val_dimension == 0: break
@@ -165,131 +199,148 @@ class Coordinate:
 			prior_val_dimension = val_dimension
 
 		# CARRY FORWARD HIGHER DIMENSIONS FROM PRIOR COORDINATE
-		if coordinate.ordinates and carry_forward_dimensions:
-			max_dimension = max(dimension for dimension in coordinate.ordinates)
+		if orthotope.unitopes and carry_forward_dimensions:
+			max_dimension = max(dimension for dimension in orthotope.unitopes)
 			for dimension in carry_forward_dimensions:
-				if dimension>max_dimension: coordinate.ordinates[dimension]=SAME_ORDINATE
+				if dimension>max_dimension: orthotope.unitopes[dimension]=SAME_ORDINATE
 
-		coordinate.certain = certain
+		orthotope.certain = certain
 
-		return coordinate
+		return orthotope
 
 
 	def verbose(self) -> str:
 		out = []
-		for dimension in sorted(self.ordinates, reverse=True): out.append(str(dimension) + str(self.ordinates[dimension]))
+		for dimension in sorted(self.unitopes, reverse=True): out.append(str(dimension) + str(self.unitopes[dimension]))
 		return SPC.join(out)
 
 
 	def __str__(self) -> str:
 		out = []
-		RASugar = 0 in self.ordinates and 1 in self.ordinates
+		RASugar = 0 in self.unitopes and 1 in self.unitopes
 
-		for dimension in sorted(self.ordinates, reverse=True):
+		for dimension in sorted(self.unitopes, reverse=True):
 			if RASugar and dimension<=1: continue
-			if self.ordinates[dimension] is SAME_ORDINATE: continue
-			out.append(str(dimension) + str(self.ordinates[dimension]))
+			if self.unitopes[dimension] is SAME_ORDINATE: continue
+			out.append(str(dimension) + str(self.unitopes[dimension]))
 
-		if RASugar: out.append(str(self.ordinates[1]) + str(self.ordinates[0]))
+		if RASugar: out.append(str(self.unitopes[1]) + str(self.unitopes[0]))
 		return SPC.join(out)
 
-
 	__repr__ = __str__
 
 
-# Polyline ::= Coordinate {SPC Coordinate}
-# n-group of coordinates
-class Polyline:
-	def __init__(self, coordinates: List[Coordinate], beg:int, end: int):
-		self.coordinates: List[Coordinate] = coordinates
-		self.beg = beg
-		self.end = end
+# Hypertope ::= Orthotope {SPC Orthotope}
+# n-group of orthotopes
+class Hypertope:
+	def __init__(self, input_orthotopes: List[Orthotope]):
+		self.input_orthotopes: List[Orthotope] = input_orthotopes
+		self.output_vectors: List[Vector] = []
 
 	@classmethod
-	def from_tokens(cls, tokens: List[Token], i: int) -> "Polyline":
-		n = len(tokens)
-		beg = i
-		coordinates: List[Coordinate] = []
+	def from_tokens(cls, tokens: TokenStream) -> "Hypertope":
+		input_orthotopes: List[Orthotope] = []
 		KEYMAP = {'a':0,'r':1,'b':2}
 
-		while i < n and tokens[i].kind != 'STATE_SEP':
-			carry_forward_dimensions = list(coordinates[-1].ordinates.keys()) if len(coordinates) else []
-			coordinate = Coordinate.from_tokens(tokens, i, carry_forward_dimensions, KEYMAP)
-			i = coordinate.end
-			if coordinate.ordinates: coordinates.append(coordinate)
+		while tokens.continue_until('STATE_SEP'):
+			carry_forward_dimensions = list(input_orthotopes[-1].unitopes.keys()) if len(input_orthotopes) else []
+			orthotope = Orthotope.from_tokens(tokens, carry_forward_dimensions, KEYMAP)
+			if orthotope.unitopes: input_orthotopes.append(orthotope)
 
-		return cls(coordinates, beg, min(i + 1, n))
+		return cls(input_orthotopes)
 
-	def member(self, wherekey:str):
-		member(wherekey, self)
+	def write(self):
+		write(self)
 
-	def __str__(self) -> str: return SPC.join(map(str, self.coordinates))
+	def __str__(self) -> str: return SPC.join(map(str, self.input_orthotopes))
 	__repr__ = __str__
 
 
-# Memelang ::= Polyline {; Polyline}
+# Memelang ::= Hypertope {; Hypertope}
+# n-group of hypertopes
 class Memelang:
 	def __init__(self, source: str):
 		self.source = source
-		self.polylines: List[Polyline] = []
+		self.hypertopes: List[Hypertope] = []
 
-		tokens = self.parse_token(source)
-		n = len(tokens)		
-		i = 0
+		tokens = TokenStream(source)
 
-		while i < n:
-			polyline = Polyline.from_tokens(tokens, i)
-			i = polyline.end
-			if polyline.coordinates: self.polylines.append(polyline)
+		while tokens.peek():
+			while tokens.peek_kind('STATE_SEP'): tokens.next()
+			hypertope = Hypertope.from_tokens(tokens)
+			if hypertope.input_orthotopes: self.hypertopes.append(hypertope)
 
-	@staticmethod
-	def parse_token(src: str) -> List[Token]:
-		tokens: List[Token] = []
-		for m in MASTER_PATTERN.finditer(src):
-			kind = m.lastgroup
-			text = m.group()
-			if kind == 'COMMENT': continue
-			if kind == 'MISMATCH': raise SyntaxError(f"Unexpected char {text!r} at {m.start()}")
-			tokens.append(Token(m.start(), kind, text))
-		return tokens
-
-	def member(self, wherekey:str):
-		for polyline in self.polylines: member(wherekey, polyline)
+	def write(self):
+		for hypertope in self.hypertopes: write(hypertope)
 
 
-	def __str__(self) -> str: return END.join(map(str, self.polylines))
+	def __str__(self) -> str: return END.join(map(str, self.hypertopes))
 	__repr__ = __str__
 
 
-# Store polylines as in-memory DB
-MEMEBASE = {}
+# Store memes as in-memory DB
 M_MIN = 1 << 20
 M_MAX = 1 << 63
-def member(wherekey:str, polyline: Polyline, pk_dimension:int = 2):
+def write(hypertope: Hypertope, pk_dimension:int = 2):
 
-	if not wherekey: raise ValueError("wherekey")
+	for i, orthotope in enumerate(hypertope.input_orthotopes):
 
-	if wherekey not in MEMEBASE: MEMEBASE[wherekey]=[]
+		if not orthotope.certain: raise ValueError(f'E_UNCERT {orthotope}')
+		if not orthotope.unitopes.get(1): raise ValueError(f'E_UNCERT {orthotope}') # KEY/COLUMN
+		if not orthotope.unitopes.get(0): raise ValueError(f'E_UNCERT {orthotope}') # VALUE
 
-	row: Dict[int, Any] = {}
-	prior_row: Dict[int, Any] = {}
-	pk_datum: Any = None # ROW PRIMARY KEY
-	for coordinate in polyline.coordinates:
+		for dimension in orthotope.unitopes:
+			if orthotope.unitopes[dimension] is SAME_ORDINATE:
+				if i==0: raise SyntaxError('E_ZERO_SAME')
+				orthotope.unitopes[dimension]=hypertope.input_orthotopes[i-1].unitopes[dimension]
 
-		if not coordinate.certain: raise ValueError("uncertain: "+str(coordinate))
-		if not coordinate.ordinates.get(1): raise ValueError("dim-1: "+str(coordinate)) # KEY/COLUMN
-		if not coordinate.ordinates.get(0): raise ValueError("dim-0: "+str(coordinate)) # VALUE
+		if not orthotope.unitopes.get(pk_dimension) or orthotope.unitopes[pk_dimension].first_kind() not in ('INT','FLOAT','IDENT','SAME'):
+			orthotope.unitopes[pk_dimension] =  Unitope(VAL_EQUALS, [Token('INT', str(random.randrange(M_MIN, M_MAX)))])
 
-		if coordinate.ordinates.get(pk_dimension) and coordinate.ordinates[pk_dimension].kind() in ('INT','FLOAT','IDENT'):
-			pk_datum = coordinate.ordinates[pk_dimension].datum() # INT IS BEST PRACTICE
-		elif not pk_datum: pk_datum = random.randrange(M_MIN, M_MAX)
 
-		row: = {}
+def query(query_hypertope: Hypertope, data_hypertope: Hypertope) -> List[Hypertope]:
 
-		for dimension in coordinate.ordinates:
-			if dimension==pk_dimension: row[dimension]=pk_datum
-			if coordinate.ordinates[dimension] is SAME_ORDINATE: row[dimension]=prior_row[dimension][-1]
-			else: row[dimension]=coordinate.ordinates[dimension].datum()
+	output_hypertopes: List[Hypertope] = []
 
-		MEMEBASE[wherekey].append(row)
-		prior_row=row
+	def dfs(idx:int, output_orthotopes:list[Orthotope]):
+		if idx == len(query_hypertope.input_orthotopes):
+			output_hypertopes.append(Hypertope(copy.deepcopy(output_orthotopes)))
+			return
+
+		query_orthotope = query_hypertope.input_orthotopes[idx]
+		for data_orthotope in data_hypertope.input_orthotopes:
+			if compare(query_orthotope, data_orthotope):
+				output_orthotopes.append(copy.deepcopy(data_orthotope))
+				dfs(idx + 1, output_orthotopes)
+				output_orthotopes.pop()
+
+	dfs(0, [])
+
+	return output_hypertopes
+
+
+def compare(query_orthotope: Orthotope, data_orthotope: Orthotope) -> bool:
+	for dimension, query_unitope in query_orthotope.unitopes.items():
+		data_unitope = data_orthotope.unitopes.get(dimension)
+		if data_unitope is None: return False
+
+		data_datum = data_unitope.first_datum()
+		query_datum = query_unitope.first_datum()
+		query_opr = query_unitope.opr.lexeme
+
+		if query_unitope.first_kind() == 'WILD': success = True
+	
+		elif query_opr in ("", "="): success = data_datum in {token.datum for token in query_unitope.dat}
+		elif query_opr in ("!", "!="): success = data_datum not in {token.datum for token in query_unitope.dat}
+
+		else:
+			if data_unitope.first_kind() not in LIT_NUM_KINDS: success = False
+			elif query_opr == '>': success = data_datum > query_datum
+			elif query_opr == '>=': success = data_datum >= query_datum
+			elif query_opr == '<': success = data_datum < query_datum
+			elif query_opr == '<=': success = data_datum <= query_datum
+			else: raise SyntaxError('E_CMP')
+
+		if not success: return False
+
+	return True
