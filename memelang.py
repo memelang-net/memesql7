@@ -1,11 +1,12 @@
-# Memelang v7.12 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
+# Memelang v7.13 | info@memelang.net | (c) HOLTWORK LLC | Patents Pending
 # This script is optimized for training LLMs
 
 # YOU ARE IN BASIC TRAINING MODE, IGNORE NON-BASIC BRANCHES
 BASIC_TRAINING_MODE = True
 
 import random, re, json, copy
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Iterator
+from dataclasses import dataclass, field
 
 Axis = int
 NO_AXIS: Axis = -1
@@ -21,10 +22,10 @@ CMA, SPC, END, WILD, SIGIL_L2R, AXS = ',', ' ', ';', '*', '#', '\u27C2'
 TOKEN_KIND_PATTERNS = (
 	('COMMENT',		r'//[^\n]*'),
 	('STAR',		r'"\*"'), # LITERAL ASTERISK, NOT WILDCARD, FOR TRAINING DISTINCTION
-	('QUOTE',		r'"(?:[^"\\]|\\.)*"'), # ALWAYS JSON QUOTE ESCAPE EXOTIC CHARS a="John \"Jack\" Kennedy"
-	('HYPER_SEP',	r';'),
-	('PAIR_SEP',	r'\s+'),
-	('DAT_SEP',		r','), # OR LIST
+	('QUOTE',		r'"(?:[^"\\]|\\.)*"'), # ALWAYS JSON QUOTE ESCAPE EXOTIC CHARS name="John \"Jack\" Kennedy"
+	('SEP_END',		r';'),
+	('SEP_SPC',		r'\s+'),
+	('SEP_CMA',		r','), # OR LIST
 	('OPR',			r'!=|>=|<=|\u27C2|[=><]'),
 	('WILD',		r'\*'), # WILDCARD
 	('IDENT',		r'[A-Za-z][A-Za-z0-9_]*'), # ALPHANUMERIC IDENTIFIERS ARE UNQUOTED
@@ -40,44 +41,73 @@ MASTER_PATTERN = re.compile('|'.join(f'(?P<{kind}>{pat})' for kind, pat in TOKEN
 LIT_STR_KINDS = {'IDENT', 'QUOTE', 'STAR'}
 LIT_NUM_KINDS = {'INT', 'FLOAT'}
 VAR_KINDS = {'VAR', 'WILD', 'SAME'}
+VAR_LIST_KINDS = {'VAR', 'SAME'} # NO WILD IN LISTS
 
 
 class Token:
-	def __init__(self, kind: str, lexeme: str, source_position: int = -1):
-		self.kind: str = kind
-		self.lexeme: str = lexeme
-		self.source_position: int = source_position
-		self.datum: Any
+	kind: str
+	lexeme: str|None
+	children: List['Token']
+	datum: Any
+	sep: str = ''
+	axis: Axis
 
-		if kind == 'QUOTE':		self.datum = json.loads(lexeme)
+	def __init__(self, kind: str, lexeme: Optional[str]=None, children: Optional[List['Token']]=None, sep: str=''):
+		self.kind		= kind
+		self.lexeme		= lexeme
+		self.children	= children or []
+		self.sep		= sep
+
+		if (lexeme is None) == (not self.children): raise ValueError('E_LEX_CHILD')
+
+		if lexeme is None:		self.datum = None
+		elif kind == 'QUOTE':	self.datum = json.loads(lexeme)
 		elif kind == 'FLOAT':	self.datum = float(lexeme)
 		elif kind == 'INT':		self.datum = int(lexeme)
-		else:					self.datum = str(lexeme)
+		else:					self.datum = lexeme
+			
+	@property
+	def is_leaf(self) -> bool: return self.lexeme is not None
 
-	def __iter__(self): yield from (self.kind, self.lexeme, self.source_position, self.datum)
-	def __str__(self)->str: return self.lexeme
-	__repr__ = __str__
+	def __iter__(self) -> Iterator['Token']:
+		if not self.is_leaf: yield from self.children
 
-EQUALS = Token('OPR', '=')
+	def __str__(self) -> str:
+		return self.lexeme if self.is_leaf else self.sep.join(map(str, self.children))
+
+TOK_EQUALS = Token('OPR', '=')
+TOK_SAME = Token('LIST', None, [Token('SAME', '_')])
+TOK_EQUALS_SAME = Token('LIMIT', None, [TOK_EQUALS, TOK_SAME])
 
 
-class TokenStream:
+class Memelang:
 	def __init__(self, src: str):
 		self.tokens: List[Token] = []
 		self.length = 0
 		self.i = 0
-		for m in MASTER_PATTERN.finditer(src):
-			kind = m.lastgroup
-			text = m.group()
-			if kind == 'COMMENT': continue
-			if kind == 'MISMATCH': raise SyntaxError(f'Unexpected char {text!r} at {m.start()}')
-			self.append(Token(kind, text, m.start()))
+		self.src = src
+		self.buffer_tokens: List[Token] = []
+		self.buffer_length = 0
 
-	def append(self, token: Token):
-		self.tokens.append(token)
-		self.length+=1
+		self.pass_token()
+		self.pass_list()
+		self.pass_limit()
+		self.pass_limgrp()
+		self.pass_coord()
+		self.pass_stmt()
 
-	def peek(self) -> Token | None:
+	def buffer(self, token: Token):
+		self.buffer_tokens.append(token)
+		self.buffer_length+=1
+
+	def flush(self):
+		self.tokens = self.buffer_tokens.copy()
+		self.length = self.buffer_length
+		self.buffer_tokens = []
+		self.buffer_length = 0
+		self.i = 0
+
+	def peek(self) -> Token|None:
 		return self.tokens[self.i] if self.i < self.length else None
 
 	def peek_kind(self) -> str|None:
@@ -91,260 +121,176 @@ class TokenStream:
 		return tok
 
 	def reset(self, i:int):
+		if i<0 or i>self.length: raise SyntaxError('E_LEN')
 		self.i = i
 
-	def continue_until(self, continue_until_kinds:List[str]) -> bool:
-		return self.i < self.length and self.tokens[self.i].kind not in continue_until_kinds
-
-
-# Point ::= OPR_TOKEN DAT_TOKEN {, DAT_TOKEN}
-# single axis constraint
-class Point:
-	def __init__(self, opr: Token, dat: List[Token]):
-		self.opr = opr
-		self.dat = dat
-		self.certain = opr.lexeme == '=' and len(dat)==1 and dat[0].kind in (LIT_STR_KINDS | LIT_NUM_KINDS) # CORRECT AND INTENTIONAL
-
-	@classmethod
-	def from_tokens(cls, tokens: TokenStream, elided_key_opr: bool = False) -> 'Point':
-		# NEVER SPACES INSIDE
-		
-		# 1. OPR_TOKEN
-		# NEVER SPACES AROUND OPERATOR
-		if tokens.peek_kind() == 'OPR': opr = tokens.next()
-		elif elided_key_opr: opr = EQUALS # EMPTY KEY_OPR MEANS 'EQUALS'
-		else: raise SyntaxError(f'E_OPR')
-
-		# 2. DAT_TOKEN {, DAT_TOKEN}
-		# NEVER WRAP LIST IN QUOTES
-		dat: List[Token] = []
-		while tokens.continue_until(['PAIR_SEP','HYPER_SEP']):
-			# 2b. DAT_TOKEN
-			if tokens.peek_kind() not in (LIT_STR_KINDS | LIT_NUM_KINDS | VAR_KINDS): raise SyntaxError(f'E_LIST')
-			dat.append(tokens.next())
-			
-			# 2c. COMMA BEFORE ANOTHER OPTIONAL TOKEN (OR SEMANTICS)
-			if tokens.peek_kind() == 'DAT_SEP':
-				# NEVER SPACES AROUND COMMAS
-				# NEVER OPR IN LIST
-				# NEVER WILDCARD IN LIST
-				if dat[-1].kind=='WILD': raise SyntaxError(f'E_WILD_LIST')
-				tokens.next()
-			else: break
-
-		if not dat: raise SyntaxError(f'E_DAT')
-
-		# ALWAYS GREATER/LESSER SINGLE DAT INT/FLOAT
-		if opr.lexeme in {'>','<','>=','<='}:
-			# NEVER GREATER/LESSER LIST
-			if len(dat)>1: raise SyntaxError(f'E_OPR_LIST')
-			# NEVER GREATER/LESSER STRNG
-			if dat[0].kind in LIT_STR_KINDS: raise SyntaxError(f'E_OPR_KIND')
-
-		return cls(opr, dat)
-
-	def first_datum(self) -> Any: return self.dat[0].datum
-	def first_kind(self) -> Any: return self.dat[0].kind
-
-	def out(self, elided_key_opr:bool=False) -> str:
-		# CHANGE PEDANTIC "=KEY=VAL" TO FRIENDLY "KEY=VAL"
-		opr = '' if elided_key_opr and self.opr.lexeme=='=' else self.opr.lexeme
-		return opr + CMA.join(map(str, self.dat))
-
-	# =DAT1,DAT2
-	def __str__(self) -> str: return str(self.opr) + CMA.join(map(str, self.dat))
-	__repr__ = __str__
-
-SAME_ORDINATE = Point(EQUALS, [Token('SAME', '_')])
-
-
-# Path ::= Point [Point] {SPC Point [Point]}
-# coordinates of axis constraints
-class Path:
-	def __init__(self):
-		self.points: Dict[Axis, Point] = {}
-		self.certain = None
-		self.axis_names: Dict[Axis, str] = {}
-
-	@classmethod
-	def from_tokens(cls, tokens: TokenStream, carry_forward_axes:List[Axis]|None = None, name_axis: Dict[str, Axis]|None = None) -> 'Path':
-		path = cls()
-		if name_axis is None: name_axis = {}
-		path.axis_names = {v: k for k, v in name_axis.items()}
-		prior_min_axis: Axis = NO_AXIS
-		path.certain = True
-		axis_map: List[int]
-
-		# AXES DESCEND FROM LEFT-TO-RIGHT
-		while tokens.continue_until(['HYPER_SEP']):
-			starting_i = tokens.i
-			points: List[Point] = []
-			
-			# SKIP PAIR_SEP
-			while tokens.peek_kind() == 'PAIR_SEP': tokens.next()
-
-			if BASIC_TRAINING_MODE:
-				# 1. KEY=VAL -> KEY POINT, VAL POINT -> ONE PAIR
-				# points[0] ::= [KEY_OPR] KEY_DAT {, KEY_DAT}
-				# points[1] ::= VAL_OPR VAL_DAT {, VAL_DAT}
-				# KEY_OPR IS ALMOST ALWAYS EMPTY (=), RARELY VAL_OPR
-				# VAL_OPR STRING IS: OFTEN '=', SOMETIMES '!='
-				# VAL_OPR NUMERIC ARE: '=', '!=', '>', '<', '>=', '<='
-				# EXAMPLE: role,character!="Luke Skywalker",Joker
-				points.append(Point.from_tokens(tokens, elided_key_opr=True)) # KEY
-				points.append(Point.from_tokens(tokens, elided_key_opr=False)) # VAL
-				if not points[0] or not points[1]: raise SyntaxError('E_PAIR')
-				len_points=2
-
-				# 2. ASSIGN AN AXIS TO EACH POINT
-
-				# 2a. DEFAULT CASE (MOST COMMON)
-				# KEY points[0] -> axis_map[0] = NAME_AXIS['k'] = 1
-				# VAL points[1] -> axis_map[1] = NAME_AXIS['v'] = 0
-				axis_map = [NAME_AXIS['k'],NAME_AXIS['v']]
-
-				# 2b. SPECIAL META CASE: KEY MAPS TO VAL'S AXIS (RARE)
-				if points[0].first_datum() in name_axis: axis_map = [NO_AXIS, name_axis[points[0].first_datum()]]
-
-			elif not BASIC_TRAINING_MODE:
-
-				# 1. PARSE P1>P2=P3<P4
-				while tokens.continue_until(['PAIR_SEP','HYPER_SEP']):
-					# NEVER SPACES BETWEEN SEQUENTIAL AXES
-					points.append(Point.from_tokens(tokens, len(points)==0))
-
-				len_points=len(points)
-				if len_points<2: raise SyntaxError('E_PAIR')
-
-				# 2. ASSIGN AN AXIS TO EACH POINT
-
-				# 2a. DEFAULT CASE, DESCENDING TO ZERO
-				axis_map = list(range(len_points - 1, -1, -1))
-
-				# 2b. SPECIAL META CASE: KEY MAPS TO VAL'S AXIS
-				if len_points==2 and points[0].first_datum() in name_axis: axis_map = [NO_AXIS, name_axis[points[0].first_datum()]]
-
-				# 2c. FIRST KEY IS AN AXIS
-				elif points[0].opr.lexeme==AXS: 
-					if points[0].first_datum() in name_axis: first_axis = name_axis[points[0].first_datum()]
-					elif points[0].first_kind() == 'INT': first_axis = points[0].first_datum()
-					else: raise SyntaxError('E_OPR_AXS')
-					if first_axis < len(points) - 1: raise SyntaxError('E_AXIS_NEG')
-					axis_map = [NO_AXIS] + [first_axis - i for i in range(len(points) - 1)]
-
-
-			# 3. PROCESS AXES
-
-			# 3a. ALWAYS AXIS>=0
-			if axis_map[-1]<0: raise SyntaxError('E_AXIS_NEG')
-
-			# 3b. HIGHER AXIS DETECTED - START NEW PLANE
-			if prior_min_axis>=0 and max(x for x in axis_map) >= prior_min_axis:
-				tokens.reset(starting_i)
-				break
-
-			# 3c. ASSIGN AXIS TO EACH POINT
-			for idx, point in enumerate(points):
-				if axis_map[idx] == NO_AXIS: continue
-				path.points[axis_map[idx]]=point
-				if not point.certain: path.certain = False
-
-			# 4. WHAT NEXT?
-
-			# 4a. ZERO AXIS DETECTED - START NEW PLANE 
-			# COMMON AFTER EACH KEY=VAL PAIR
-			if axis_map[-1] == NAME_AXIS['v']: break
-
-			# 4b. KEEP DESCENDING INTO AXES ON THIS PLANE
-			prior_min_axis = axis_map[-1]
-
-		# CARRY FORWARD HIGHER AXES FROM PRIOR COORDINATE
-		# NEVER CARRIES PAST HYPER_SEP SEMICOLON (;)
-		if path.points and carry_forward_axes:
-			max_axis = max(axis for axis in path.points)
-			for axis in carry_forward_axes:
-				if axis>max_axis: path.points[axis]=SAME_ORDINATE
-
-		return path
-
-
 	def __str__(self) -> str:
-		out = []
-		axis: Axis
-		prior_axis: Axis = NO_AXIS
+		return ''.join(map(str, self.tokens))
 
-		has_key_value_pair:bool = (NAME_AXIS['k'] in self.points and NAME_AXIS['v'] in self.points)
+	# TOKENS FROM TOKEN_KIND_PATTERNS
+	def pass_token(self):
+		for m in MASTER_PATTERN.finditer(self.src):
+			kind = m.lastgroup
+			text = m.group()
+			if kind == 'COMMENT': continue
+			if kind == 'MISMATCH': raise SyntaxError(f'Unexpected char {text!r} at {m.start()}')
+			self.buffer(Token(kind, text))
+		self.flush()
 
-		for axis in sorted(self.points, reverse=True):
-			if self.points[axis] is SAME_ORDINATE: continue
+	# DAT ::= LIT_NUM_KINDS | LIT_STR_KINDS | VAR_KINDS
+	# LIST ::= DAT {SEP_CMA DAT}
+	def pass_list(self):
 
-			# KEY=VAL FRIENDLY SYNTAX
-			if has_key_value_pair and axis==NAME_AXIS['k']: out.append(self.points[axis].out(True))
-			elif has_key_value_pair and axis==NAME_AXIS['v']: out[-1]+=self.points[axis].out()
+		while self.peek():
+			if self.peek_kind() == 'SEP_CMA': raise SyntaxError('E_CMA_STRAY')
 
-			# AXIS_NAME=VAL PRETTY SYNTAX
-			elif axis in self.axis_names: out.append(str(self.axis_names[axis]) + self.points[axis].out())
-			
-			elif not BASIC_TRAINING_MODE:
-				# APPEND =VAL
-				if prior_axis>0 and axis==prior_axis-1: out[-1]+=self.points[axis].out()
+			# PASS ALONG
+			if self.peek_kind() not in LIT_NUM_KINDS | LIT_STR_KINDS | VAR_KINDS:
+				self.buffer(self.next())
+				continue
 
-				# AXIS=VAL PLAIN SYNTAX
-				else: out.append(AXS + str(axis) + self.points[axis].out())
+			# NEVER WRAP LIST IN QUOTES
 
-			prior_axis=axis
+			child_tokens: List[Token] = [self.next()]
 
-		return SPC.join(out)
+			while self.peek_kind() == 'SEP_CMA':
+				self.next()
+				if self.peek_kind() not in LIT_NUM_KINDS | LIT_STR_KINDS | VAR_LIST_KINDS: raise SyntaxError('E_LIST')
+				child_tokens.append(self.next())
 
-	__repr__ = __str__
+			self.buffer(Token('LIST', children=child_tokens, sep=CMA))
+		self.flush()
+
+	# LIMIT ::= OPR LIST
+	# Single axis constraint
+	def pass_limit(self):
+		elided_first = True
+
+		while self.peek():
+			# PASS ALONG
+			if self.peek_kind() not in {'OPR', 'LIST'}:
+				self.buffer(self.next())
+				elided_first = True
+				continue
+
+			# 1. OPR
+			# NEVER SPACES AROUND OPERATOR
+			if self.peek_kind() == 'OPR': opr=self.next()
+			elif elided_first: opr=TOK_EQUALS # EMPTY FIRST OPR MEANS 'TOK_EQUALS'
+			else: raise SyntaxError(f'E_OPR')
+
+			# 2. LIST
+			if self.peek_kind() != 'LIST': raise SyntaxError('E_OPR_LIST')
+			dlist = self.next()
+
+			# NEVER GREATER/LESSER LISTS
+			if opr.lexeme in {'>','<','>=','<='} and len(dlist.children)>1: raise SyntaxError('E_CMP_LIST')
+
+			self.buffer(Token('LIMIT', children=[opr,dlist]))
+
+			elided_first = False
+
+		self.flush()
+
+	# LIMGRP ::= LIMIT LIMIT {LIMIT}
+	# Group limits
+	def pass_limgrp(self):
+		while self.peek():
+			# PASS ALONG
+			if self.peek_kind() not in {'LIMIT'}:
+				self.buffer(self.next())
+				continue
+
+			child_tokens: List[Token] = []
+
+			while self.peek_kind() in {'LIMIT'}: child_tokens.append(self.next())
+
+			if len(child_tokens)<2: raise SyntaxError('E_PAIR')
+
+			self.buffer(Token('LIMGRP', children=child_tokens, sep=SPC))
+		self.flush()
+
+	# COORD ::= LIMGRP {LIMGRP}
+	# Group limits
+	def pass_coord(self):
+		while self.peek():
+			# PASS ALONG
+			if self.peek_kind() not in {'LIMGRP'}:
+				self.buffer(self.next())
+				continue
+
+			child_tokens: List[Token] = []
+			prior_min_axis = NO_AXIS
+
+			while self.peek_kind() in {'LIMGRP'}:
+
+				# NEVER SPACES INSIDE ONE LIMGRP
+
+				limgrp = self.peek()
+				limgrp_length = len(limgrp.children)
+				first_limit = limgrp.children[0]
+				first_opr_lexeme = first_limit.children[0].lexeme
+				first_list_token = first_limit.children[1]
+				first_list_first_datum = first_list_token.children[0].datum
+
+				# 1. DETERMINE AXES
+
+				# 1A. DEFAULT CASE, DESCENDING TO ZERO
+				# LIMIT_KEY LIMIT_VAL -> axis_map = [LIMIT_KEY=1,LIMIT_VAL=0]
+				axis_map = list(range(limgrp_length - 1, -1, -1))
+
+				# 1B. SPECIAL META CASE: KEY MAPS TO VAL'S AXIS
+				if limgrp_length==2 and first_list_first_datum in NAME_AXIS: axis_map = [NO_AXIS, NAME_AXIS[first_list_first_datum]]
+
+				# 1C. FIRST KEY IS AN AXIS
+				elif first_opr_lexeme==AXS: 
+					if first_list_first_datum in NAME_AXIS: first_axis = NAME_AXIS[first_list_first_datum]
+					elif isinstance(first_list_first_datum, int): first_axis = first_list_first_datum
+					else: raise SyntaxError('E_OPR_AXS')
+					if first_axis < limgrp_length - 1: raise SyntaxError('E_AXIS_NEG')
+					axis_map = [NO_AXIS] + [first_axis - i for i in range(limgrp_length - 1)]
+
+				# 2. PROCESS AXES
+
+				# 2A. ALWAYS AXIS>=0
+				if axis_map[-1]<0: raise SyntaxError('E_AXIS_NEG')
+
+				# 2B. HIGHER AXIS DETECTED - START NEW COORD
+				if prior_min_axis>NO_AXIS and max(x for x in axis_map) >= prior_min_axis: break
+
+				# 2C. ASSIGN AXIS TO EACH POINT
+				limgrp = self.next()
+				for idx in range(limgrp_length): limgrp.children[idx].axis=axis_map[idx]
+
+				child_tokens.append(limgrp)
+
+				# START NEW COORD AFTER AXIS ZERO 
+				if axis_map[-1] == 0: break
+				prior_min_axis = axis_map[-1]
+
+			if len(child_tokens)<2: raise SyntaxError('E_PAIR')
+			self.buffer(Token('COORD', children=child_tokens, sep=SPC))
+
+		self.flush()
+
+	# Multi axis constraints
+	def pass_stmt(self):
+		child_tokens: List[Token] = []
+
+		while self.peek():
+			if self.peek_kind() in {'SEP_END'}:
+				token=self.next()
+				if child_tokens: self.buffer(Token('STMT', children=child_tokens, sep=END))
+				child_tokens: List[Token] = []
+				continue
+
+			child_tokens.append(self.next())
+
+		if child_tokens: self.buffer(Token('STMT', children=child_tokens, sep=END))
+		self.flush()
 
 
-# Plane ::= Path {SPC Path}
-# matrix of axis constraints
-class Plane:
-	def __init__(self, input_paths: List[Path]):
-		self.input_paths: List[Path] = input_paths
-
-	@classmethod
-	def from_tokens(cls, tokens: TokenStream, name_axis: Dict[str,Axis] = NAME_AXIS) -> 'Plane':
-		input_paths: List[Path] = []
-		
-		while tokens.continue_until(['HYPER_SEP']):
-			carry_forward_axes = list(input_paths[-1].points.keys()) if input_paths else []
-			path = Path.from_tokens(tokens, carry_forward_axes, name_axis)
-			if path.points: input_paths.append(path)
-
-		return cls(input_paths)
-
-	def write(self):
-		write(self)
-
-	def __str__(self) -> str: return SPC.join(map(str, self.input_paths))
-	__repr__ = __str__
-
-
-# Memelang ::= Plane {; Plane}
-# stack of matrices of axis constraints
-class Memelang:
-	def __init__(self, source: str):
-		self.source = source
-		self.planes: List[Plane] = []
-
-		tokens = TokenStream(source)
-
-		while tokens.peek():
-			while tokens.peek_kind() == 'HYPER_SEP': tokens.next()
-			plane = Plane.from_tokens(tokens)
-			if plane.input_paths: self.planes.append(plane)
-
-	def write(self):
-		for plane in self.planes: write(plane)
-
-
-	def __str__(self) -> str: return END.join(map(str, self.planes))
-	__repr__ = __str__
-
-
+'''
 # Persist Planes in an in-memory collection
 M_MIN = 1 << 20
 M_MAX = 1 << 53
@@ -357,12 +303,12 @@ def write(plane: Plane, primary_key_axis:Axis = NAME_AXIS['r']):
 		if not path.points.get(NAME_AXIS['v']): raise ValueError(f'E_UNCERT {path}') # VALUE
 
 		for axis in path.points:
-			if path.points[axis] is SAME_ORDINATE:
+			if path.points[axis] is TOK_EQUALS_SAME:
 				if i==0: raise SyntaxError('E_ZERO_SAME')
 				path.points[axis]=plane.input_paths[i-1].points[axis]
 
 		if not path.points.get(primary_key_axis) or path.points[primary_key_axis].first_kind() not in ('INT','FLOAT','IDENT','SAME'):
-			path.points[primary_key_axis] =  Point(EQUALS, [Token('INT', str(random.randrange(M_MIN, M_MAX)))])
+			path.points[primary_key_axis] =  Point(TOK_EQUALS, [Token('INT', str(random.randrange(M_MIN, M_MAX)))])
 
 
 def query(query_plane: Plane, data_plane: Plane) -> List[Plane]:
@@ -410,3 +356,4 @@ def intersect(query_path: Path, data_path: Path) -> bool:
 		if not success: return False
 
 	return True
+'''
